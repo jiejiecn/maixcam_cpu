@@ -74,6 +74,39 @@ the device `.config`, and `riscv64-linux-gnu-gcc`:
 The result is `prebuilt/mpll_freq.ko`; its vermagic must be
 `5.10.4-tag- preempt mod_unload riscv64`. See [docs/DESIGN_en.md](docs/DESIGN_en.md) for details.
 
+## Frequency sweep (850–1000 MHz)
+
+Method: switch with the module, then run 6 repetitions of a fixed workload
+(1.5 M integer additions, best value; best of two sweeps), followed by a 25 s
+full-load burn for the temperature. The launcher was stopped before the test.
+
+| Target | `MPLL_CSR` | Benchmark (best) | vs 850 | Temperature (idle / load) |
+|---|---|---|---|---|
+| 850 MHz | `0x07448101` | 3.936 s | 1.00x | 60.9 / 61.2 °C |
+| 875 MHz | `0x07468101` | 3.816 s | 1.03x | 60.5 / 61.2 °C |
+| 900 MHz | `0x07488101` | 3.723 s | 1.06x | 60.5 / 60.9 °C |
+| 925 MHz | `0x074A8101` | 3.612 s | 1.09x | 60.2 / 61.2 °C |
+| 950 MHz | `0x074C8101` | 3.590 s | 1.10x | 60.2 / 60.9 °C |
+| 975 MHz | `0x074E8101` | 3.433 s | 1.15x | 60.2 / 61.2 °C |
+| 1000 MHz | `0x07508101` | 3.437 s | 1.15x | 60.2 / 60.9 °C |
+
+Observations:
+
+* from 850 to 975 MHz the speedup is roughly linear in frequency
+  (measured 1.03/1.06/1.09/1.10/1.15 vs theoretical 1.03/1.06/1.09/1.12/1.15);
+* **975 → 1000 MHz brings no further gain** (1.15x vs 1.18x theoretical), probably because the
+  CPU AXI port (`clk_cpu_axi0`, fixed at 500 MHz) or memory bandwidth becomes the bottleneck;
+* **the temperature stays within 60.2–61.2 °C and does not visibly depend on frequency**:
+  25 s of load is not enough to create a gradient, and the sensor resolution is about 0.35 °C;
+* the system is stable at 1000 MHz (no hang, no warnings/oops), but there is no voltage scaling,
+  so long-term stability has to be evaluated by the user.
+
+> Note: the Python-loop benchmark is sensitive to background load (two sweeps of the same
+> frequency can differ by 20–30%). The table takes the best of two sweeps, so the absolute
+> values are only meaningful for relative comparison within this table.
+
+---
+
 ## Notes
 
 - **Not persistent**: a reboot returns to 850 MHz;
