@@ -7,9 +7,18 @@
 
 ---
 
-## 1. 原理
+## 1. 概述
 
-### 1.1 时钟树
+### 1.1 发现了什么
+
+* 设备是 MaixCAM Pro（SG2002，单核 RISC-V C906），内核 `5.10.4-tag-`；
+* CPU 实际工作频率 **850 MHz**（`clk_c906_0`），父时钟 `clk_mpll = 25 MHz × 34 = 850 MHz`；
+* **固定频率，不随任务负载自动调节**：
+  * 内核没有 cpufreq 子系统（`/sys/devices/system/cpu/cpu0/cpufreq` 不存在），没有 governor / DVFS；
+  * MaixCDK / MaixPy 只有 `cpu_freq()`、`cpu_temp()`、`npu_freq()` 三个读取接口，没有设置接口；
+* 温度：空闲约 59.5 °C，有负载时 60 ～ 63.7 °C。
+
+### 1.2 CPU 调节原理
 
 ```
 osc 25 MHz ──> clk_mpll (MPLL, 850 MHz = 25 × 34)
@@ -17,15 +26,10 @@ osc 25 MHz ──> clk_mpll (MPLL, 850 MHz = 25 × 34)
                     └──> clk_c906_0 (mux + divider) ──> CPU core (hart 0, C906)
 ```
 
-* `clk_c906_0` 是个 mux/divider，**没有** `CLK_SET_RATE_PARENT` 标志，
-  所以对它调 `clk_set_rate()` 不会上溯到 PLL，必须直接改 `clk_mpll`。
-* 内核**没有 cpufreq 子系统**（`/sys/devices/system/cpu/cpu0/cpufreq` 不存在），
-  MaixCDK / MaixPy 也只有 `cpu_freq()`、`cpu_temp()`、`npu_freq()` 三个**读取**接口，没有设置接口。
-
-### 1.2 为什么 `devmem` 直接写 PLL 无效
-
-时钟控制器基址 `0x03002000`（设备树 `clk-reset-controller`，`compatible = "cvitek,clk-reset"`），
-MPLL 控制寄存器 `MPLL_CSR = base + 0x908`，字段布局（参见 mainline `drivers/clk/sophgo/clk-cv1800.c`）：
+* `clk_c906_0` 是 mux/divider，**没有** `CLK_SET_RATE_PARENT` 标志，
+  对它调 `clk_set_rate()` 不会上溯到 PLL；要改频必须直接对 `clk_mpll` 调。
+* 时钟控制器基址 `0x03002000`（设备树 `clk-reset-controller`，`compatible = "cvitek,clk-reset"`），
+  MPLL 控制寄存器 `MPLL_CSR = base + 0x908`：
 
 | 位域 | 含义 |
 |---|---|
@@ -37,25 +41,23 @@ MPLL 控制寄存器 `MPLL_CSR = base + 0x908`，字段布局（参见 mainline 
 
 `rate = 25 MHz × div / (pre_div × post_div)`
 
-实测：
+* **只改 div 不够**：用 `devmem` 把 div 从 34 改成 36（`0x00488101`），频率仍是 850 MHz；
+  而走 `clk_set_rate()` 时厂商驱动 `cv181x_g6_pll_set_rate()` 会同时重算 `ictrl`，
+  PLL 才真正切换。实测三组值：
 
 | 状态 | `MPLL_CSR` | 频率 |
 |---|---|---|
 | 开机（div=34, ictrl=0） | `0x00448101` | 850 MHz |
-| 裸 `devmem` 只改 div=36 | `0x00488101` | **仍是 850 MHz**（无效） |
-| 经 `clk_set_rate()` 设 900 | `0x07488101`（div=36, **ictrl=7**） | 900 MHz |
-| 经 `clk_set_rate()` 设 850 | `0x07448101`（div=34, ictrl=7） | 850 MHz |
+| 裸 `devmem` 改 div=36 | `0x00488101` | 850 MHz（无效） |
+| `clk_set_rate(900 MHz)` | `0x07488101`（div=36, ictrl=7） | 900 MHz |
 
-**结论：只改分频位不够，驱动在改频时会同时重算 `ictrl`。**
-`clk_set_rate()` 走的是厂商驱动 `cv181x_g6_pll_set_rate`，它会写 CSR 并等待 PLL 锁定，
-这才是正确、可用的改频方式。
+### 1.3 这个项目做了什么
 
-### 1.3 模块做了什么
-
-1. `clk_get(NULL, "clk_mpll")` 拿到 PLL 时钟；
-2. 延迟 `delay_ms` 后在 workqueue 里调 `clk_set_rate(mpll, target)`；
-3. 用 `ioremap(0x03002000)` 读 `MPLL_CSR` 前后值，连同 `clk_get_rate()` 结果打到 dmesg；
-4. 卸载时只 `clk_put()`（**不会**把频率恢复）。
+* 提供一个内核模块 `mpll_freq.ko`：`clk_get(NULL, "clk_mpll")` → 延迟 → `clk_set_rate(mpll, target)`；
+* 用 `ioremap(0x03002000)` 读 `MPLL_CSR` 的前后值，连同 `clk_get_rate()` 一起打到 dmesg，方便验证；
+* 参数：`target`（目标频率，Hz，25 MHz 的整数倍）、`delay_ms`（加载后延迟多久真正改频）；
+* 只动 `clk_mpll`（只喂 CPU），不碰 DDR / 显示 / 视频 / USB 的 PLL；
+* 卸载只做 `clk_put()`，**不恢复频率**；重启后 bootloader 会重新配置回 850 MHz。
 
 ---
 

@@ -11,9 +11,20 @@ Target: **MaixCAM Pro / LicheeRV Nano (SG2002, single-core RISC-V C906)**, kerne
 
 ---
 
-## 1. How it works
+## 1. Overview
 
-### 1.1 Clock tree
+### 1.1 What we found
+
+* The device is a MaixCAM Pro (SG2002, single-core RISC-V C906) running kernel `5.10.4-tag-`.
+* The CPU actually runs at **850 MHz** (`clk_c906_0`), fed by `clk_mpll = 25 MHz x 34 = 850 MHz`.
+* **The frequency is fixed and does not scale with workload**:
+  * there is no cpufreq subsystem (`/sys/devices/system/cpu/cpu0/cpufreq` does not exist),
+    no governor and no DVFS;
+  * MaixCDK / MaixPy only expose read helpers (`cpu_freq()`, `cpu_temp()`, `npu_freq()`),
+    there is no API to set the frequency.
+* Temperature: about 59.5 °C idle, 60–63.7 °C under load.
+
+### 1.2 How the CPU clock is controlled
 
 ```
 osc 25 MHz ──> clk_mpll (MPLL, 850 MHz = 25 x 34)
@@ -22,17 +33,11 @@ osc 25 MHz ──> clk_mpll (MPLL, 850 MHz = 25 x 34)
 ```
 
 * `clk_c906_0` is a mux/divider **without** `CLK_SET_RATE_PARENT`, so calling
-  `clk_set_rate()` on it does not propagate to the PLL. The PLL (`clk_mpll`)
+  `clk_set_rate()` on it does not propagate to the PLL; the PLL (`clk_mpll`)
   has to be targeted directly.
-* The kernel has **no cpufreq subsystem** (`/sys/devices/system/cpu/cpu0/cpufreq`
-  does not exist), and MaixCDK / MaixPy only provide read-only helpers
-  (`cpu_freq()`, `cpu_temp()`, `npu_freq()`). There is no upstream API to set the frequency.
-
-### 1.2 Why writing the PLL with `devmem` does not work
-
-The clock controller base is `0x03002000` (device tree `clk-reset-controller`,
-`compatible = "cvitek,clk-reset"`). The MPLL control register is
-`MPLL_CSR = base + 0x908` with this layout (mainline `drivers/clk/sophgo/clk-cv1800.c`):
+* The clock controller base is `0x03002000` (device tree `clk-reset-controller`,
+  `compatible = "cvitek,clk-reset"`). The MPLL control register is
+  `MPLL_CSR = base + 0x908`:
 
 | Bits | Field |
 |---|---|
@@ -44,27 +49,28 @@ The clock controller base is `0x03002000` (device tree `clk-reset-controller`,
 
 `rate = 25 MHz x div / (pre_div x post_div)`
 
-Measured on a real board:
+* **Changing the divider alone is not enough**: writing `devmem` to change div from 34 to 36
+  (`0x00488101`) leaves the clock at 850 MHz; going through `clk_set_rate()` makes the vendor
+  driver `cv181x_g6_pll_set_rate()` recompute `ictrl` as well, and only then does the PLL switch.
+  Measured values:
 
 | State | `MPLL_CSR` | Frequency |
 |---|---|---|
 | Boot (div=34, ictrl=0) | `0x00448101` | 850 MHz |
-| Raw `devmem`, div changed to 36 | `0x00488101` | **still 850 MHz** (no effect) |
-| `clk_set_rate(900 MHz)` | `0x07488101` (div=36, **ictrl=7**) | 900 MHz |
-| `clk_set_rate(850 MHz)` | `0x07448101` (div=34, ictrl=7) | 850 MHz |
+| Raw `devmem`, div=36 | `0x00488101` | 850 MHz (no effect) |
+| `clk_set_rate(900 MHz)` | `0x07488101` (div=36, ictrl=7) | 900 MHz |
 
-**Conclusion:** changing the divider alone is not enough — the vendor driver also
-recomputes the `ictrl` field. `clk_set_rate()` goes through
-`cv181x_g6_pll_set_rate()`, which writes the CSR with the proper ictrl and waits
-for the PLL to lock. That is the correct way to change the frequency.
+### 1.3 What this project does
 
-### 1.3 What the module does
-
-1. `clk_get(NULL, "clk_mpll")` to obtain the PLL clock;
-2. after `delay_ms`, call `clk_set_rate(mpll, target)` from a workqueue;
-3. `ioremap(0x03002000)` and log `MPLL_CSR` before/after together with
-   `clk_get_rate()` results to dmesg;
-4. on unload only `clk_put()` is called — **the frequency is not restored**.
+* Provides a kernel module `mpll_freq.ko`: `clk_get(NULL, "clk_mpll")` → delay →
+  `clk_set_rate(mpll, target)`.
+* Uses `ioremap(0x03002000)` to read `MPLL_CSR` before and after the change and logs it
+  together with `clk_get_rate()` to dmesg for verification.
+* Parameters: `target` (frequency in Hz, an integer multiple of 25 MHz) and
+  `delay_ms` (how long to wait after loading before touching the PLL).
+* Touches only `clk_mpll` (which feeds the CPU), never the DDR / display / video / USB PLLs.
+* Unloading only calls `clk_put()` and **does not restore the frequency**; after a reboot the
+  bootloader programs 850 MHz again.
 
 ---
 
